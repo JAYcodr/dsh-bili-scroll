@@ -1,3 +1,28 @@
+## 3.0.0 — 2026-11-18
+
+> Fork 重构版（`JAYcodr/dsh-bili-scroll`，无 `dsh-go` 兼容包袱），全面围绕「像真人在逛 B 站、像朋友顺手安利」四大维度重构。
+
+### 1. 语言与人设（`lib/persona.mjs` & `vendor/bilibili-mcp/style_guard.py`）
+- 新增四档基础说话人设预设（`buddy` / `chill_geek` / `curious_night` / `custom`），与自定义 `personaPrompt` / 路径型 `AGENTS.md`、北京时间时段情绪、近期评论/私信开场防重一起统一编译进定时轮与私信对话轮。
+- 彻底统一私信人格链条（修复以往私信回复不读路径型人设、易漏 Markdown/字数尾巴的问题）。
+- 升级 Python 端与 JS 端 `style_guard`，支持 `relaxed` / `balanced` / `strict` 三档去 AI 八股检测与评论区 AI 撞车识别（`ai_swarm_suspected`）。
+
+### 2. 浏览与互动节律（`lib/rhythm.mjs` & `vendor/bilibili-mcp/mcp_server.py`）
+- 新增谷时窗口随机抖动调度（支持跨午夜锚定与尾段 20 分钟保底）、全天配额分散多轮（`splitDailyRounds` / `roundMaxPicks`）。
+- 拓展有机浏览工具：相关推荐 `bili_related_videos`、关注动态 `bili_dynamic_feed`、观看历史 `bili_history`、多页搜索 `bili_search(page)`、热评时间排序 `bili_comments(order)`、拟人 log-normal 浏览节律停顿。
+- 新增白名单严格门控的静默轻互动：`bili_like`、`bili_watch_later_add`、`bili_coin`，以及概率性公开评论与撞车避让。
+
+### 3. 长期记忆与偏好演化（`lib/memory.mjs` & `vendor/bilibili-mcp/duty_store.py`）
+- 在 `$DSH_HOME/bili-duty/memory/` 持久化口味画像（指数衰减 `memoryHalfLifeDays`）、UP 主好感/屏蔽、反馈流水与情景记忆，支持私信反馈信号提取、轮后幂等演化与 UI 卡片即时反馈。
+- 新增只读读取本地 `nova_memory/facts/` 事实库的能力（`syncNovaMemory`），并新增设置页「记忆」第 5 个页签。
+- 新增窄口状态/记忆 MCP 工具：`duty_pick_record`、`duty_report_today`、`duty_digest_search`、`duty_memory_recall`、`duty_memory_note`。
+
+### 4. 朋友安利式日报与私信（`lib/delivery.mjs` & `prompts/duty.md` & `index.js` & `client.js`）
+- 重写 `prompts/duty.md` 为 friend-first 值班章程：日报允许自然安利叙事，靠隐藏 `<!-- bili-pick: ... -->` 锚点 + `picks/<day>.jsonl` 边车保证配额、卡片墙与自动收藏不失真。
+- 私信清洗 Markdown 与内部术语，严格控制在 500 字符上限内并支持自然拆分（防 B站 `code 21007`）；修复 `dmOwnerUid` 识别优先级、`dmWatchMinutes` 热重载、连续多条未读私信合批与 `dmReplyRunning`/超额时不误标已读等宿主角虫；顺手提升 `syncNotes()` 跨请求缓存与 `lib/verify.mjs` 解析边界。
+
+---
+
 ## 2.5.2 — 2026-11-13
 
 **① 热重载 / 在线安装之后，改设置会静默失败**（#198，感谢 @xueyue33）
@@ -678,7 +703,8 @@ Windows 用 `icacls` 断继承（只留当前用户），Linux/macOS 用 `chmod 
 
 **修（同一批用户日志里翻出来的两条）**
 
-- ⭐ **找不到 dsh 时别再硬跑**：以前 esolveDsh() 找不到就退化成裸 dsh 去 spawn ⇒ 那一轮必然失败，
+- ⭐ **找不到 dsh 时别再硬跑**：以前 
+esolveDsh() 找不到就退化成裸 dsh 去 spawn ⇒ 那一轮必然失败，
   日志只留一句 code=1 和一段 'dsh' 不是内部或外部命令 的**乱码**，用户完全不知道该怎么办。
   现在直接**停下来说清楚**（"这一轮没跑：找不到 dsh，请在设置里把「dsh 路径」指到 …"），并照常补一份占位报告；
   「一键升级」同样处理。
