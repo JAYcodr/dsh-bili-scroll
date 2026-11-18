@@ -150,6 +150,16 @@ select[data-bd-input] option,select[data-bd-input] optgroup{
 [data-bd-kv]{font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary,#9aa0a6);word-break:break-all;}
 [data-bd-badge]{font-size:11px;padding:2px 7px;border-radius:6px;
   background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-bd-tags]{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px;}
+[data-bd-tag]{font-size:10px;padding:1px 6px;border-radius:4px;
+  background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.14));color:var(--dsw-alias-label-secondary,inherit);}
+[data-bd-acts]{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
+[data-bd-act]{cursor:pointer;font:inherit;font-size:11px;padding:2px 8px;border-radius:6px;
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(127,127,127,.24));background:transparent;
+  color:var(--dsw-alias-label-secondary,inherit);}
+[data-bd-act]:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.14));
+  color:var(--dsw-alias-label-primary,inherit);}
+[data-bd-act][data-picked]{border-color:#22c55e;color:#22c55e;}
 `
 
     // ⚠️ 与 lib/state.mjs 的 WINDOWS 保持一致（官方口径：工作日 9–12、14–18 是高峰，其余都是谷时）
@@ -202,9 +212,30 @@ select[data-bd-input] option,select[data-bd-input] optgroup{
     /* ────────────── 设置页正文 ────────────── */
 
 /* ────────────── 会话头那个 tab：它刷过的视频（最小实验版）────────────── */
+function VideoFeedbackRow({ item, pickedState, onFeedback }) {
+  const tags = Array.isArray(item.tags) ? item.tags.filter(Boolean).slice(0, 4) : []
+  const actBtn = (label, action, active) => h('button', {
+    'data-bd-act': '',
+    'data-picked': active ? '' : undefined,
+    onClick: (e) => { e.stopPropagation(); onFeedback(item, action) },
+  }, label)
+  return h('div', null,
+    tags.length ? h('div', { 'data-bd-tags': '' },
+      tags.map((t) => h('span', { key: t, 'data-bd-tag': '' }, '#' + t))) : null,
+    h('div', { 'data-bd-acts': '' },
+      actBtn(pickedState === 'like' ? '👍 已记好感' : '👍 对胃口', 'like', pickedState === 'like'),
+      actBtn(pickedState === 'dislike' ? '👎 已记踩雷' : '👎 太水', 'dislike', pickedState === 'dislike'),
+      item.up
+        ? (item.upMuted
+          ? actBtn('✅ 解除屏蔽UP', 'unmute_up', false)
+          : actBtn(pickedState === 'mute_up' ? '🚫 已屏蔽UP' : '🚫 屏蔽UP', 'mute_up', pickedState === 'mute_up'))
+        : null))
+}
+
 function WatchTab() {
   const PAGE = 30
   const onOpenUrl = (u) => { jpost('/open', { what: 'url', u }).catch(() => {}) }
+  const [fbMap, setFbMap] = React.useState({})
   // ⭐ 2026-11-04：DSH 切视图 / 切浏览器标签回来会卸载重挂这个组件 ⇒ 筛选和滚动位置得存到 sessionStorage，
   //    否则点开视频再回来就跳回「全部」了（页面关掉才清，这个重置才算合理）。
   const BD_WT_KEY = 'bd-watched-tab'
@@ -246,6 +277,23 @@ function WatchTab() {
     load(st, tier, n)
     try { window.scrollTo(0, 0) } catch { /* 翻页才滚到顶；筛选时不滚，保住用户的位置 */ }
   }
+  const sendFeedback = (item, action) => {
+    jpost('/feedback', {
+      action,
+      bvid: item.bvid,
+      title: item.title,
+      up: item.up,
+      tags: item.tags || [],
+    }).then((r) => {
+      if (!r || !r.ok) return
+      setFbMap((m) => ({ ...m, [item.bvid]: action }))
+      setRows((prev) => Array.isArray(prev)
+        ? prev.map((row) => row.up && row.up === item.up
+          ? { ...row, upMuted: action === 'mute_up' ? true : (action === 'unmute_up' ? false : row.upMuted) }
+          : row)
+        : prev)
+    }).catch(() => {})
+  }
   const chip = (label, on, active) => h('button', { 'data-bd-chip': '', 'aria-selected': active ? 'true' : 'false', onClick: on }, label)
   return h('div', { 'data-bd-page': '', 'data-bd-wide': '' },
     h('div', { 'data-bd-row': '' },
@@ -264,8 +312,10 @@ function WatchTab() {
         h('div', { 'data-bd-item-body': '' },
           h('div', { 'data-bd-item-t': '' }, x.title),
           h('div', { 'data-bd-item-n': '' }, `${x.day} · ${x.up} · `, x.picked ? '挑中了' : '跳过', (x.delivered || x.commented) ? ' · 已发给你' : '',
+            x.upMuted ? ' · 已屏蔽UP' : '',
             x.tier ? h('span', { 'data-bd-tier': x.tier }, ' · ' + x.tier) : null),
-          x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null))))
+          x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null,
+          h(VideoFeedbackRow, { item: x, pickedState: fbMap[x.bvid], onFeedback: sendFeedback })))))
       : h('div', { 'data-bd-note': '' }, rows === null ? '' : '这一类还没有记录 —— 跑一轮之后就有了'),
     total > PAGE ? h('div', { 'data-bd-row': '' },
       h('button', { 'data-bd-btn': '', disabled: offset <= 0, onClick: () => go(-PAGE) }, '上一页'),
@@ -310,11 +360,27 @@ function WatchTab() {
     const [watchedTier, setWatchedTier] = React.useState('')
     const [watchedOffset, setWatchedOffset] = React.useState(0)
     const [watchedTotal, setWatchedTotal] = React.useState(0)
-    const [tab, setTab] = React.useState('daily')   // daily | taste | social | adv
+    const [tab, setTab] = React.useState('daily')   // daily | taste | social | memory | adv
       const [diag, setDiag] = React.useState(null)      // 诊断信息文本
       const [checks, setChecks] = React.useState(null)   // 环境自检结果 [{name, ok, detail, fix}]
       const [loginState, setLoginState] = React.useState('')
       const [loginTone, setLoginTone] = React.useState('')
+      // v3.0 拟人化草稿状态
+      const [pPreset, setPPreset] = React.useState(null)
+      const [antiAi, setAntiAi] = React.useState(null)
+      const [browseMix, setBrowseMix] = React.useState(null)
+      const [rStyle, setRStyle] = React.useState(null)
+      const [dmStyle, setDmStyle] = React.useState(null)
+      const [dmWatchMins, setDmWatchMins] = React.useState(null)
+      const [jitterMax, setJitterMax] = React.useState(null)
+      const [roundMax, setRoundMax] = React.useState(null)
+      const [cChance, setCChance] = React.useState(null)
+      const [likeMax, setLikeMax] = React.useState(null)
+      const [wlMax, setWlMax] = React.useState(null)
+      const [coinMax, setCoinMax] = React.useState(null)
+      const [memData, setMemData] = React.useState(null)
+      const [memNoteDraft, setMemNoteDraft] = React.useState('')
+      const [fbMap, setFbMap] = React.useState({})
       /* ⚠️ 扫码轮询的 timer 必须能停：切走设置页后还在跑的话会在已卸载的组件上 setState，
        *    重复点「扫码登录」还会叠出第二个 timer。（2026-10-16 审查修） */
       const loginTimer = React.useRef(null)
@@ -342,7 +408,95 @@ function WatchTab() {
         if (cfg && excl === null) setExcl((cfg.excludeWords || []).join('\n'))
         if (cfg && cLen === null) setCLen(cfg.commentLength || 'medium')
         if (cfg && fSort === null) setFSort(cfg.searchSort || 'pubdate')
+        if (cfg && pPreset === null) setPPreset(cfg.personaPreset || 'buddy')
+        if (cfg && antiAi === null) setAntiAi(cfg.antiAiStrictness || 'balanced')
+        if (cfg && browseMix === null) setBrowseMix(cfg.browseMix || 'auto')
+        if (cfg && rStyle === null) setRStyle(cfg.reportStyle || 'friend')
+        if (cfg && dmStyle === null) setDmStyle(cfg.dmStyle || 'friend')
+        if (cfg && dmWatchMins === null) setDmWatchMins(String(cfg.dmWatchMinutes ?? 1))
+        if (cfg && jitterMax === null) setJitterMax(String(cfg.windowJitterMaxMin ?? 45))
+        if (cfg && roundMax === null) setRoundMax(String(cfg.roundMaxPicks ?? 3))
+        if (cfg && cChance === null) setCChance(String(cfg.commentChance ?? 65))
+        if (cfg && likeMax === null) setLikeMax(String(cfg.likePerRound ?? 2))
+        if (cfg && wlMax === null) setWlMax(String(cfg.watchLaterPerRound ?? 2))
+        if (cfg && coinMax === null) setCoinMax(String(cfg.coinPerDay ?? 1))
       }, [cfg])
+
+      const loadMemory = async () => {
+        setBusy('memory')
+        try {
+          const r = await jget('/memory')
+          if (alive.current && r && r.ok) setMemData(r)
+        } catch (e) { say('读取长期记忆失败：' + String(e?.message ?? e), 'warn') }
+        finally { if (alive.current) setBusy('') }
+      }
+      React.useEffect(() => {
+        if (tab === 'memory' && memData === null) loadMemory()
+      }, [tab])
+
+      const onPanelFeedback = async (item, action) => {
+        try {
+          const r = await jpost('/feedback', {
+            action,
+            bvid: item.bvid || '',
+            title: item.title || '',
+            up: item.up || '',
+            tags: item.tags || [],
+          })
+          if (!r || !r.ok) { say('反馈写入失败：' + ((r && r.error) || '未知错误'), 'warn'); return }
+          setFbMap((m) => ({ ...m, [item.bvid || item.up]: action }))
+          if (Array.isArray(watchedRows) && item.up) {
+            setWatchedRows((rows) => rows.map((row) => row.up === item.up
+              ? { ...row, upMuted: action === 'mute_up' ? true : (action === 'unmute_up' ? false : row.upMuted) }
+              : row))
+          }
+          if (tab === 'memory' || memData !== null) {
+            const mr = await jget('/memory').catch(() => null)
+            if (alive.current && mr?.ok) setMemData(mr)
+          }
+          const labels = { like: '已记为喜欢', dislike: '已降权此类视频', mute_up: '已屏蔽该 UP 主', unmute_up: '已解除屏蔽该 UP 主' }
+          say(labels[action] || '反馈已记录', 'good')
+        } catch (e) { say(String(e?.message ?? e), 'warn') }
+      }
+
+      const onResolveThread = async (matchText) => {
+        setBusy('memory')
+        try {
+          const r = await jpost('/memory/resolve-thread', { matchText })
+          if (r && r.ok) {
+            say(`已消除 ${r.resolvedCount || 0} 条待跟进话题`, 'good')
+            await loadMemory()
+          } else say((r && r.error) || '操作失败', 'warn')
+        } catch (e) { say(String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const onAddMemNote = async () => {
+        const text = String(memNoteDraft || '').trim()
+        if (!text) return
+        setBusy('memory')
+        try {
+          const r = await jpost('/memory/note', { kind: 'note', summary: text })
+          if (r && r.ok) {
+            setMemNoteDraft('')
+            say('已记进长期记忆', 'good')
+            await loadMemory()
+          } else say((r && r.error) || '写入失败', 'warn')
+        } catch (e) { say(String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const onDmCheck = async () => {
+        setBusy('dm')
+        try {
+          await jpost('/dm-check', {})
+          say('已主动查了一次私信', 'good')
+        } catch (e) { say('查私信失败：' + String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const fmtBjtMin = (m) => {
+        if (typeof m !== 'number' || !Number.isFinite(m)) return ''
+        const mod = ((Math.round(m) % 1440) + 1440) % 1440
+        return String(Math.floor(mod / 60)).padStart(2, '0') + ':' + String(mod % 60).padStart(2, '0') + ' BJT'
+      }
 
       // ⭐ 收藏夹列表：只读一次，读不到就空列表（别每 5 秒重拉）
       // ⚠️ 2026-10-28：它要起一个 Python 去问 B站（1~3 秒）⇒ **延迟 1.2 秒再拉**，
@@ -612,7 +766,7 @@ function WatchTab() {
             ? '读不到插件配置（已经试了 ' + fails + ' 次）。常见原因有三个：装的还是 0.1.11 / 0.1.12（那两版有 bug，会卡在这里）；刚装完没重启 dsh；或者插件加载失败。'
             : '读设置中…'),
           fails >= 6 ? h('div', { 'data-bd-note': '' },
-            '可以先试：升级到最新版（dsh plugin --profile web add github:c1overzz/dsh-bili-scroll）→ 重启 dsh；还不行就把 ' +
+            '可以先试：升级到最新版（dsh plugin --profile web add github:JAYcodr/dsh-bili-scroll）→ 重启 dsh；还不行就把 ' +
             '%USERPROFILE%\\.dsh\\bili-duty\\duty.log 的最后几十行发给作者。') : null)
       }
 
@@ -684,7 +838,7 @@ function WatchTab() {
 
         /* ── 定时 ── */
         h('div', { 'data-bd-tabs': '' },
-          [['daily', '日常'], ['taste', '偏好'], ['social', '互动'], ['adv', '高级']].map(([v, label]) =>
+          [['daily', '日常'], ['taste', '偏好'], ['social', '互动'], ['memory', '记忆'], ['adv', '高级']].map(([v, label]) =>
             h('button', { key: v, 'data-bd-tab': '', 'aria-selected': tab === v ? 'true' : 'false', onClick: () => setTab(v) }, label))),
 
         h('div', { 'data-bd-row': '' },
@@ -705,7 +859,30 @@ function WatchTab() {
               note: `${win[k].start} – ${win[k].end}`,
               on: sw(k),
               onChange: (v) => patch({ [k]: v }, win[k].label),
-            }))) : null),
+            })),
+            h(ToggleRow, {
+              label: '拟人错峰随机唤醒（拒绝整点打卡）',
+              note: '窗口开始后随机推迟几分钟到几十分钟再动手（尾段 20 分钟兜底不误事）',
+              on: 'jitterEnabled' in optim ? Boolean(optim.jitterEnabled) : cfg.jitterEnabled !== false,
+              onChange: (v) => patch({ jitterEnabled: v }, '拟人错峰抖动'),
+            }),
+            (cfg.jitterEnabled !== false) ? h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '最大随机延迟（分钟）'),
+                h('div', { 'data-bd-note': '' }, '0–90 分钟，默认 45；设 0 等价于准点唤醒')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 90,
+                value: jitterMax ?? '45',
+                onChange: (e) => setJitterMax(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(jitterMax) || 0, 90)); setJitterMax(String(n)); patch({ windowJitterMaxMin: n }, '最大随机延迟') },
+              })) : null,
+            (typeof st.rhythm?.nextNoon === 'number' || typeof st.rhythm?.nextNight === 'number')
+              ? h('div', { 'data-bd-note': '' },
+                  '今日已排点：'
+                  + [typeof st.rhythm?.nextNoon === 'number' ? '午间 ' + fmtBjtMin(st.rhythm.nextNoon) : '',
+                     typeof st.rhythm?.nextNight === 'number' ? '夜间 ' + fmtBjtMin(st.rhythm.nextNight) : '']
+                    .filter(Boolean).join(' · '))
+              : null) : null),
 
         /* ── 一轮挑几条 ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'daily', 'data-bd-away': tab === 'daily' ? undefined : '' },
@@ -720,6 +897,23 @@ function WatchTab() {
               onChange: (e) => setPerDay(e.target.value),
               onBlur: () => { const n = Math.max(0, Math.min(Number(perDay) || 0, 50)); setPerDay(String(n)); patch({ perDay: n }, '每天挑几条') },
             })),
+          h(ToggleRow, {
+            label: '分散多轮挑片（像真人间歇逛一逛）',
+            note: '把全天额度拆进午间与晚间两轮，单轮不一口气塞满',
+            on: 'splitDailyRounds' in optim ? Boolean(optim.splitDailyRounds) : cfg.splitDailyRounds !== false,
+            onChange: (v) => patch({ splitDailyRounds: v }, '分散多轮挑片'),
+          }),
+          (cfg.splitDailyRounds !== false) ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '单轮最多挑几条'),
+                h('div', { 'data-bd-note': '' }, '默认 3 条（1–10 条）')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 1, max: 10,
+                value: roundMax ?? '3',
+                onChange: (e) => setRoundMax(e.target.value),
+                onBlur: () => { const n = Math.max(1, Math.min(Number(roundMax) || 3, 10)); setRoundMax(String(n)); patch({ roundMaxPicks: n }, '单轮最多挑几条') },
+              }))) : null,
           st.lastRunAt ? h('div', { 'data-bd-note': '' }, `上次跑：${new Date(st.lastRunAt).toLocaleString('zh-CN')}`) : null),
 
         /* ── 用哪个模型跑 ──（⭐ 2026-11-04：挪到「高级」—— 它装的时候定一次就好，不是每天会动的东西；摆在「日常」里会让人以为要天天调） */
@@ -795,12 +989,31 @@ function WatchTab() {
             onBlur: () => { const v = String(mention || '').trim(); setMention(v); patch({ mentionName: v }, '发给谁') },
           }),
           (dmMode && dmMode !== 'off') ? h('div', { 'data-bd-note': '' }, '私信会发给他（用昵称自动查一次 UID）；查不到就改回只发评论，不会一条都不送。') : null,
-          (dmMode && dmMode !== 'off') ? h('div', { 'data-bd-note': '' }, '私信内容 = 本轮每条的「标题 + 链接 + 一句话」，一轮合并成一条发。⚠️ 建议先让这个号和收件人互关：B站 对「陌生人私信」会限流，还可能不弹提醒。') : null,
+          (dmMode && dmMode !== 'off') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-label': '' }, '私信说话口吻'),
+            h('select', {
+              'data-bd-input': '', value: dmStyle ?? 'friend',
+              onChange: (e) => { setDmStyle(e.target.value); patch({ dmStyle: e.target.value }, '私信口吻') },
+            },
+              h('option', { value: 'friend' }, '朋友聊天口吻（默认 —— 纯文本随口安利，无 Markdown 壳）'),
+              h('option', { value: 'digest' }, '精简清单（只列标题、链接与一句话）')),
+            h(ToggleRow, {
+              label: '允许长推荐拆成 1–3 条自然短消息',
+              note: 'B站私信单条 500 字上限（超了会 code 21007 拒收），拆发更自然也防被拒',
+              on: 'dmSplitMessages' in optim ? Boolean(optim.dmSplitMessages) : cfg.dmSplitMessages !== false,
+              onChange: (v) => patch({ dmSplitMessages: v }, '私信拆条'),
+            }),
+            h(ToggleRow, {
+              label: '没挑到好视频时静默写日报，不发私信打扰',
+              note: '免得每轮空跑还发一句「今天没刷到」',
+              on: 'dmSkipEmpty' in optim ? Boolean(optim.dmSkipEmpty) : cfg.dmSkipEmpty !== false,
+              onChange: (v) => patch({ dmSkipEmpty: v }, '空轮私信静默'),
+            })) : null,
 
           (dmMode === 'off' || dmMode === 'both') ? h('div', { 'data-bd-sep': '' }) : null,
           (dmMode === 'off' || dmMode === 'both') ? h(ToggleRow, {
             label: '自动评论并 @ 你',
-            note: '开了之后它会在挑中的视频下面留评论，并 @ 上面那个人',
+            note: '开了之后它会在挑中的视频下面留评论，并 @ 上面那个人（遇 AI 扎堆或类似观点会自动避让）',
             on: sw('autoComment'),
             onChange: (v) => patch({ autoComment: v }, '自动评论'),
           }) : null,
@@ -814,6 +1027,17 @@ function WatchTab() {
                 value: perRound ?? '',
                 onChange: (e) => setPerRound(e.target.value),
                 onBlur: () => { const n = Math.max(0, Math.min(Number(perRound) || 0, 20)); setPerRound(String(n)); patch({ commentPerRound: n }, '每轮发几条评论') },
+              }))) : null,
+          (dmMode === 'off' || dmMode === 'both') && sw('autoComment') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '触发评论的概率（%）'),
+                h('div', { 'data-bd-note': '' }, '不是每看必评 —— 按这个概率克制决定发不发公开评论（默认 65%）')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 100,
+                value: cChance ?? '65',
+                onChange: (e) => setCChance(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(cChance) || 0, 100)); setCChance(String(n)); patch({ commentChance: n }, '评论概率') },
               }))) : null,
           (dmMode === 'off' || dmMode === 'both') && sw('autoComment') ? h('div', { 'data-bd-sub': '' },
             h('div', { 'data-bd-row': '' },
@@ -846,12 +1070,72 @@ function WatchTab() {
               }))) : null,
 
           h('div', { 'data-bd-sep': '' }),
+          h('div', { 'data-bd-label': '' }, '静默轻互动（帮号养推荐画像，不发公开评论刷屏）'),
+          h(ToggleRow, {
+            label: '顺手点赞真正对胃口的视频',
+            note: '默认关；开启后每轮最多轻点几条确实有干货的视频',
+            on: sw('autoLike'),
+            onChange: (v) => patch({ autoLike: v }, '顺手点赞'),
+          }),
+          sw('autoLike') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' }, h('div', { 'data-bd-label': '' }, '每轮最多点赞条数')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 10,
+                value: likeMax ?? '2',
+                onChange: (e) => setLikeMax(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(likeMax) || 0, 10)); setLikeMax(String(n)); patch({ likePerRound: n }, '点赞上限') },
+              }))) : null,
+          h(ToggleRow, {
+            label: '顺手加入「稍后再看」',
+            note: '长篇好内容先塞进稍后再看列表（不占收藏夹）',
+            on: sw('autoWatchLater'),
+            onChange: (v) => patch({ autoWatchLater: v }, '稍后再看'),
+          }),
+          sw('autoWatchLater') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' }, h('div', { 'data-bd-label': '' }, '每轮最多加入条数')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 10,
+                value: wlMax ?? '2',
+                onChange: (e) => setWlMax(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(wlMax) || 0, 10)); setWlMax(String(n)); patch({ watchLaterPerRound: n }, '稍后再看上限') },
+              }))) : null,
+          h(ToggleRow, {
+            label: '极佳精品顺手投 1 币',
+            note: '谨慎消费硬币：只对极高质量视频每日最多投几枚（默认关）',
+            on: sw('autoCoin'),
+            onChange: (v) => patch({ autoCoin: v }, '顺手投币'),
+          }),
+          sw('autoCoin') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' }, h('div', { 'data-bd-label': '' }, '每天最多投币枚数')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, max: 5,
+                value: coinMax ?? '1',
+                onChange: (e) => setCoinMax(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(coinMax) || 0, 5)); setCoinMax(String(n)); patch({ coinPerDay: n }, '每日投币上限') },
+              }))) : null,
+
+          h('div', { 'data-bd-sep': '' }),
           h(ToggleRow, {
             label: '私信双向（有人私信它就回一句）',
             note: '默认开。你在 B站 私信里跟它说话，它会回你（陌生人的私信不回）。⭐ 查私信本身不花 token，只有真收到你的新消息时才花一点点。',
             on: Boolean(dmWatch),
             onChange: (v) => { setDmWatch(v); patch({ dmWatch: v }, '私信双向') },
           }),
+          dmWatch ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '私信巡检间隔（分钟）'),
+                h('div', { 'data-bd-note': '' }, '1–60 分钟，改完即刻热重载定时器')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 1, max: 60,
+                value: dmWatchMins ?? '1',
+                onChange: (e) => setDmWatchMins(e.target.value),
+                onBlur: () => { const n = Math.max(1, Math.min(Number(dmWatchMins) || 1, 60)); setDmWatchMins(String(n)); patch({ dmWatchMinutes: n }, '私信巡检间隔') },
+              }),
+              h('button', { 'data-bd-btn': '', disabled: busy === 'dm', onClick: onDmCheck }, '立即查一次'))) : null,
           // ⭐ 2026-10-23：**不加新输入框**，只把"它认谁当主人"显示出来 —— 填错当场看得见 ✓
           (st.ownerInfo && dmWatch) ? h('div', { 'data-bd-note': '' },
             '它会认这个人当主人：',
@@ -900,7 +1184,25 @@ function WatchTab() {
 
         /* ── 关注什么 / 在哪儿刷 ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'taste', 'data-bd-away': tab === 'taste' ? undefined : '' },
-          h('div', { 'data-bd-h': '' }, '关注什么'),
+          h('div', { 'data-bd-h': '' }, '关注什么与说话风格'),
+          h('div', { 'data-bd-label': '' }, '浏览渠道混搭方式'),
+          h('select', {
+            'data-bd-input': '', value: browseMix ?? 'auto',
+            onChange: (e) => { setBrowseMix(e.target.value); patch({ browseMix: e.target.value }, '浏览混搭方式') },
+          },
+            h('option', { value: 'auto' }, '智能混搭（推荐流 / 动态 / 轮换关键词 / 相关视频 / 老UP回访）'),
+            h('option', { value: 'recommend' }, '首页推荐流为主 + 顺藤摸瓜'),
+            h('option', { value: 'search' }, '关键词搜索为主（多页扫一眼）'),
+            h('option', { value: 'dynamic' }, '关注动态与高好感 UP 为主'),
+            h('option', { value: 'mixed' }, '全面平均探索')),
+          h(ToggleRow, {
+            label: '跳过 B站「观看历史」里已经看过的视频',
+            note: '每轮开刷前先看一眼近期观看历史，避免给你反复安利你看过的旧片',
+            on: 'skipWatchedHistory' in optim ? Boolean(optim.skipWatchedHistory) : cfg.skipWatchedHistory !== false,
+            onChange: (v) => patch({ skipWatchedHistory: v }, '跳过观看历史'),
+          }),
+          h('div', { 'data-bd-sep': '' }),
+          h('div', { 'data-bd-label': '' }, '关键词（一行一个；留空 = 纯靠首页推荐流自然漫游）'),
           h('textarea', {
             'data-bd-input': '', rows: 5, placeholder: '一行一个关键词；留空 = 刷首页推荐流（像人一样随便逛）',
             value: kws ?? '', onChange: (e) => setKws(e.target.value),
@@ -916,10 +1218,34 @@ function WatchTab() {
             h('option', { value: 'click' }, '播放最多'),
             h('option', { value: 'dm' }, '弹幕最多'),
             h('option', { value: 'totalrank' }, '综合')),
-          h('div', { 'data-bd-label': '' }, '它按什么说话（人设提示词）—— 留空也能用：默认口语、短句、必带一个只有看了那条视频才说得出的细节'),
+          h('div', { 'data-bd-sep': '' }),
+          h('div', { 'data-bd-label': '' }, '基础说话人设预设'),
+          h('select', {
+            'data-bd-input': '', value: pPreset ?? 'buddy',
+            onChange: (e) => { setPPreset(e.target.value); patch({ personaPreset: e.target.value }, '人设预设') },
+          },
+            h('option', { value: 'buddy' }, '损友 / 熟人（随和吐槽，像微信转发安利 · 默认）'),
+            h('option', { value: 'chill_geek' }, '摸鱼技术宅（短促直白，看重实操复现，厌恶套壳）'),
+            h('option', { value: 'curious_night' }, '深夜好奇党（冷门考据、反直觉细节与松弛感）'),
+            h('option', { value: 'custom' }, '完全自定义（只听下面的人设框或工作区 AGENTS.md）')),
+          h('div', { 'data-bd-label': '' }, '去 AI 味严格度'),
+          h('select', {
+            'data-bd-input': '', value: antiAi ?? 'balanced',
+            onChange: (e) => { setAntiAi(e.target.value); patch({ antiAiStrictness: e.target.value }, '去 AI 味档位') },
+          },
+            h('option', { value: 'balanced' }, '平衡（拦截常见总结腔与重复开场 · 默认）'),
+            h('option', { value: 'strict' }, '严格（禁一切书面套话与分点作文，必带视频具体细节）'),
+            h('option', { value: 'relaxed' }, '宽松（只拦截最生硬的机械八股与内部词泄露）')),
+          h(ToggleRow, {
+            label: '允许极克制的 AI 自嘲（偶发调侃注意力/信息密度）',
+            note: '关闭则彻底像真人朋友，不拿「上下文/本鱼本鲸」自嘲',
+            on: 'aiSelfMock' in optim ? Boolean(optim.aiSelfMock) : cfg.aiSelfMock !== false,
+            onChange: (v) => patch({ aiSelfMock: v }, 'AI 自嘲开关'),
+          }),
+          h('div', { 'data-bd-label': '' }, '补充人设提示词 —— 会叠加在预设之上（或选择 custom 后独占生效）'),
           h('textarea', {
             'data-bd-input': '', rows: 6,
-            placeholder: '想让它怎么说话就写在这儿 —— 比如「叫我某某，说话简短点，别用 emoji」。也可以直接填一个文件路径（如 D:\\deepseek\\AGENTS.md，或它所在的那个目录），每次运行都会重新读那个文件。留空 = 按中性说话（不扮演任何人）。',
+            placeholder: '想让它怎么说话就写在这儿 —— 比如「叫我某某，说话简短点，别用 emoji」。也可以直接填一个文件路径（如 D:\\deepseek\\AGENTS.md，或它所在的那个目录），每次运行都会重新读那个文件。',
             value: persona ?? '', onChange: (e) => setPersona(e.target.value),
           }),
           // ⭐ 2.0.5（issue #89）：把人设字数亮出来 —— 超 40000 只送前 40000、超 60000 保存就截，得让用户自己看得见
@@ -931,6 +1257,13 @@ function WatchTab() {
             (st.personaFromWs && String(persona || '').trim() === '')
               ? '你现在还是用「工作区」里那份 AGENTS.md 说话的（照旧生效）。想把它搬到这儿改，就把上面的路径填成本机那个目录。'
               : '改完点下面「保存」；下一轮就按这个说话。'),
+          h('div', { 'data-bd-label': '' }, '日报口吻'),
+          h('select', {
+            'data-bd-input': '', value: rStyle ?? 'friend',
+            onChange: (e) => { setRStyle(e.target.value); patch({ reportStyle: e.target.value }, '日报口吻') },
+          },
+            h('option', { value: 'friend' }, '朋友安利随记（自然开场 + 人话点评 + 隐藏卡片元数据 · 默认）'),
+            h('option', { value: 'structured' }, '结构化清单（标题 / 档位 / 推荐理由分项列出）')),
           h('div', { 'data-bd-label': '' }, '日报写多细'),
           h('select', {
             'data-bd-input': '', value: rl ?? 'full',
@@ -980,13 +1313,74 @@ function WatchTab() {
                   h('a', { href: x.url, target: '_blank', rel: 'noreferrer' }, x.title)),
                 h('div', { 'data-bd-item-n': '' },
                   `${x.day} · ${x.up} · `, x.picked ? '挑中了' : '跳过', (x.delivered || x.commented) ? ' · 已发给你' : '',
+                  x.upMuted ? ' · 已屏蔽UP' : '',
                   x.tier ? h('span', { 'data-bd-tier': x.tier }, ' · ' + x.tier) : null),
-                x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null))))
+                x.why ? h('div', { 'data-bd-item-why': '' }, x.why) : null,
+                h(VideoFeedbackRow, { item: x, pickedState: fbMap[x.bvid], onFeedback: onPanelFeedback })))))
             : null,
           watchedRows !== null && watchedTotal > WATCH_PAGE ? h('div', { 'data-bd-row': '' },
             h('button', { 'data-bd-btn': '', disabled: watchedOffset <= 0, onClick: () => onWatchPage(-WATCH_PAGE) }, '上一页'),
             h('div', { 'data-bd-note': '' }, `${watchedOffset + 1}–${Math.min(watchedOffset + WATCH_PAGE, watchedTotal)} / ${watchedTotal}`),
             h('button', { 'data-bd-btn': '', disabled: watchedOffset + WATCH_PAGE >= watchedTotal, onClick: () => onWatchPage(WATCH_PAGE) }, '下一页')) : null),
+
+        /* ── 长期记忆与偏好演化（memory tab） ── */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'memory', 'data-bd-away': tab === 'memory' ? undefined : '' },
+          h('div', { 'data-bd-row': '' },
+            h('div', { 'data-bd-h': '', style: { flex: 1 } }, '长期口味与记忆'),
+            h('button', { 'data-bd-btn': '', disabled: busy === 'memory', onClick: loadMemory }, '刷新记忆')),
+          h(ToggleRow, {
+            label: '开启长期口味演化与情景记忆',
+            note: '每轮挑片/跳过、私信反馈和界面点赞都会沉淀到 memory/ 目录并随时间半衰',
+            on: 'memoryEnabled' in optim ? Boolean(optim.memoryEnabled) : cfg.memoryEnabled !== false,
+            onChange: (v) => patch({ memoryEnabled: v }, '长期记忆'),
+          }),
+          h(ToggleRow, {
+            label: '只读参考 Nova Memory 个人事实',
+            note: '若本地装有 Nova Memory，仅抽取作选片语感参考，绝不写进公开评论',
+            on: 'syncNovaMemory' in optim ? Boolean(optim.syncNovaMemory) : cfg.syncNovaMemory !== false,
+            onChange: (v) => patch({ syncNovaMemory: v }, 'Nova Memory 读取'),
+          }),
+          h('div', { 'data-bd-row': '' },
+            h('input', {
+              'data-bd-input': '',
+              placeholder: '手写一条偏好备忘（比如：最近多看看嵌入式和 Rust，少推营销评测）',
+              value: memNoteDraft,
+              onChange: (e) => setMemNoteDraft(e.target.value),
+            }),
+            h('button', { 'data-bd-btn': '', disabled: busy === 'memory' || !memNoteDraft.trim(), onClick: onAddMemNote }, '记进记忆')),
+          memData === null ? h('div', { 'data-bd-note': '' }, '记忆读取中…') : h('div', null,
+            h('div', { 'data-bd-kv': '' },
+              `主题 ${memData.summary?.counts?.topics || 0} · 关注过 UP ${memData.summary?.counts?.ups || 0} · 屏蔽 UP ${memData.summary?.counts?.mutedUps || 0} · 未完话题 ${(memData.summary?.openThreads || []).length} · 情景 ${memData.summary?.counts?.episodes || 0}`),
+            (memData.summary?.topTopics || []).length ? h('div', null,
+              h('div', { 'data-bd-label': '' }, '偏好主题权重'),
+              h('div', { 'data-bd-tags': '' },
+                memData.summary.topTopics.map((t) => h('span', { key: t.name, 'data-bd-tag': '' },
+                  `${t.name} (${Number(t.score || 0).toFixed(1)})`)))) : null,
+            (memData.summary?.topUps || []).length ? h('div', null,
+              h('div', { 'data-bd-label': '' }, '常看 / 高好感 UP 主'),
+              h('div', { 'data-bd-tags': '' },
+                memData.summary.topUps.map((u) => h('span', { key: u.name, 'data-bd-tag': '' },
+                  `${u.name} (+${Number(u.affinity || 0).toFixed(1)})`)))) : null,
+            (memData.summary?.mutedUps || []).length ? h('div', null,
+              h('div', { 'data-bd-label': '' }, '已屏蔽 UP 主（点击可恢复）'),
+              h('div', { 'data-bd-acts': '' },
+                memData.summary.mutedUps.map((u) => h('button', {
+                  key: u.name, 'data-bd-act': '',
+                  onClick: () => onPanelFeedback({ up: u.name }, 'unmute_up'),
+                }, `✅ 解除屏蔽 · ${u.name}`)))) : null,
+            (memData.summary?.openThreads || []).length ? h('div', null,
+              h('div', { 'data-bd-label': '' }, '未完待续话题'),
+              memData.summary.openThreads.slice(0, 6).map((th, idx) => h('div', { key: th.id || idx, 'data-bd-row': '' },
+                h('div', { 'data-bd-note': '', style: { flex: 1 } }, `${th.day || ''} · ${th.summary || th.title || ''}`),
+                h('button', {
+                  'data-bd-act': '',
+                  onClick: () => onResolveThread(th.summary || th.title || th.bvid),
+                }, '标记完成')))) : null,
+            (memData.episodes || []).length ? h('div', null,
+              h('div', { 'data-bd-label': '' }, '最近情景记忆'),
+              memData.episodes.slice(0, 8).map((ep, idx) => h('div', { key: ep.id || idx, 'data-bd-note': '' },
+                `[${ep.day || ''}] ${ep.kind || ''} · ${ep.up ? ep.up + ' · ' : ''}${ep.summary || ep.title || ''}`)))
+              : h('div', { 'data-bd-note': '' }, '还没有积累记忆 —— 刷几轮或在上面点 👍 / 👎 就会慢慢长出来。'))),
 
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
           h('div', { 'data-bd-row': '' },

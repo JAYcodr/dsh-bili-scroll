@@ -17,15 +17,33 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 #      ⑥ `bili_cover` / `bili_frames`：封面和画面帧**作为图片**返回（上游没有；
 #         图能不能进模型上下文由宿主判断）
 import asyncio
-import random
-import json
-import re
 import base64
+import datetime as _dt
+import inspect
+import json
 import os
+import random
+import re
 import struct
 import sys
 import tempfile
 from pathlib import Path
+
+_MCP_DIR = str(Path(__file__).resolve().parent)
+if _MCP_DIR not in sys.path:
+    sys.path.insert(0, _MCP_DIR)
+
+import duty_store  # noqa: E402
+from style_guard import (  # noqa: E402
+    STYLE_LEAD as _STYLE_LEAD,
+    bigrams as _bigrams,
+    bigram_similarity as _sim,
+    check_comment_style,
+    looks_like_ai_swarm,
+    normalize_mention as _normalize_mention,
+    sanitize_plain_text,
+)
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
@@ -38,16 +56,29 @@ from bilibili_api.video_uploader import (
 from bilibili_api.utils.picture import Picture
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
-# 2.3.0 throttle: every read tool sleeps 0.6-1.6s before running
-async def _throttle():
+_PAUSE_WINDOWS = {
+    "browse": (0.5, 1.5, -0.15),
+    "read": (0.8, 2.2, 0.25),
+    "write": (1.0, 2.6, 0.45),
+}
+
+
+async def _human_pause(kind: str = "browse") -> None:
+    """对数正态分布 + 偶发微停顿，替代机械固定间隔。"""
+    lo, hi, mu = _PAUSE_WINDOWS.get(kind, _PAUSE_WINDOWS["browse"])
+    delay = min(hi, max(lo, random.lognormvariate(mu, 0.35)))
+    if random.random() < 0.12:
+        delay = random.uniform(2.5, 3.5)
     try:
-        await asyncio.sleep(random.uniform(0.6, 1.6))
+        await asyncio.sleep(delay)
     except Exception:
         pass
+
 
 # ========== 初始化 ==========
 
 CRED_FILE = Path(__file__).parent / "bili_credential.json"
+DUTY_HOME = Path(os.environ.get("BILI_DUTY_HOME") or (Path.home() / ".dsh" / "bili-duty"))
 
 mcp = FastMCP("bilibili-mcp")
 
@@ -79,37 +110,12 @@ def _guard(name: str) -> str:
 
 
 # ⭐⭐ 语感闸门（治"鱼八股"）：**发评论之前，先在函数里拦一道**
-#   背景：章程里写"要有具体细节、别客套"，模型照样写"这条我认""值得一看" ——
-#         禁令没有范例有效、自觉没有拦截可靠 ⇒ 在执行层做最后一道检查（跟 _guard 同一思路）。
-#   三道检查（便宜、纯本地 / 一次轻请求）：
-#     ① 开头八股黑名单（正则）
-#     ② 跟**自己以前发过的评论**太像（bigram 相似度）—— 治"每条一个味"
-#     ③ 跟**这条视频现有热评**太像 —— 治"跟别的鱼撞车"
-#   ⚠️ 撞了就**不发**，把原因和改法返回给模型，让它重写一句。
-#   ⚠️ 关掉：`BILI_STYLE_OFF=1`。
+#   委托给 style_guard.check_comment_style：
+#     ① 扩展开头八股黑名单 / AI 分点列表 / 连接词 / 客服尾 / Markdown 泄漏
+#     ② 跟**自己以前发过的评论**太像或连续同词干开头
+#     ③ 跟**这条视频现有热评**太像
+#   ⚠️ 关掉：`BILI_STYLE_OFF=1`；严厉度：`BILI_STYLE_STRICTNESS=relaxed|balanced|strict`。
 _STYLE_OFF = os.environ.get("BILI_STYLE_OFF", "") in ("1", "true", "yes")
-_STYLE_LEAD = re.compile(
-    r"^\s*(?:"
-    r"这条(?:我认|我记下了|值得)|我记下了|值得一看|确实值得|不得不说|"
-    r"好家伙|这个(?:必须|真的要)|强烈推荐|感谢分享|学到了|受教了|"
-    r"作为一个|总之|综上"
-    r")"
-)
-
-
-def _bigrams(s: str) -> set:
-    t = re.sub(r"[^\w\u4e00-\u9fff]", "", "".join(ch for ch in str(s or "") if not ch.isspace()))
-    if len(t) < 2:
-        return set(t)
-    return {t[i:i + 2] for i in range(len(t) - 1)}
-
-
-def _sim(a: str, b: str) -> float:
-    """bigram Jaccard —— 够用、够快、零依赖"""
-    x, y = _bigrams(a), _bigrams(b)
-    if not x or not y:
-        return 0.0
-    return len(x & y) / max(1, len(x | y))
 
 
 def _ledger_path():
@@ -143,45 +149,50 @@ def _ledger_append(text: str, bvid: str, rpid=None):
         p = _ledger_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
-            f.write(f"- {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} {bvid} rpid={rpid or 0} · {' '.join(str(text).split())}\n")
+            f.write(
+                f"- {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} {bvid} "
+                f"rpid={rpid or 0} · {' '.join(str(text).split())}\n"
+            )
     except Exception:
         pass
 
 
 async def _style_reason(text: str, bvid: str, cred) -> str:
     """返回"为什么这句不能发"；空串 = 可以发"""
-    if _STYLE_OFF:
+    if _STYLE_OFF or os.environ.get("BILI_STYLE_OFF", "") in ("1", "true", "yes"):
         return ""
-    body = " ".join(str(text or "").split())
-    if not body:
-        return "评论是空的。"
-    m = _STYLE_LEAD.match(body)
-    if m:
-        return (f"开头「{m.group(0).strip()}」是鱼八股。直接说这条视频里的具体东西："
-                "「这期讲了什么 + 一个只有看了才说得出的细节」，开头别用套话。")
-    for old in _ledger_recent(30):
-        s = _sim(body, old)
-        if s >= 0.55:
-            return (f"这句跟你以前发过的「{old[:18]}…」太像了（相似度 {s:.2f}）。"
-                    "换开头、换关注点，别套同一个句式。")
-    try:
-        v = video.Video(bvid=bvid, credential=cred)
-        aid = (await v.get_info())["aid"]
-        resp = await comment.get_comments(
-            oid=aid, type_=comment.CommentResourceType.VIDEO, page_index=1,
-            order=comment.OrderType.LIKE, credential=cred,
-        )
-        for c in (resp.get("replies") or [])[:20]:
-            other = " ".join(str((c.get("content") or {}).get("message", "")).split())
-            if not other:
-                continue
-            s = _sim(body, other)
-            if s >= 0.5:
-                return (f"这条视频底下已经有一句很像的（相似度 {s:.2f}）：{other[:24]}… "
-                        "撞车了 —— 换个角度写，或者这一轮不发。")
-    except Exception:
-        pass  # 读不到热评就不做这道检查（不能因为读不到就不让发）
-    return ""
+    strictness = os.environ.get("BILI_STYLE_STRICTNESS", "balanced").strip().lower() or "balanced"
+    own_comments = _ledger_recent(30)
+    local_reason = check_comment_style(
+        text,
+        own_comments=own_comments,
+        hot_comments=[],
+        strictness=strictness,
+    )
+    if local_reason:
+        return local_reason
+
+    hot_comments: list[str] = []
+    if bvid and cred is not None:
+        try:
+            v = video.Video(bvid=bvid, credential=cred)
+            aid = (await v.get_info())["aid"]
+            resp = await comment.get_comments(
+                oid=aid, type_=comment.CommentResourceType.VIDEO, page_index=1,
+                order=comment.OrderType.LIKE, credential=cred,
+            )
+            for c in (resp.get("replies") or [])[:20]:
+                other = " ".join(str((c.get("content") or {}).get("message", "")).split())
+                if other:
+                    hot_comments.append(other)
+        except Exception:
+            pass  # 读不到热评就不做这道检查（不能因为读不到就不让发）
+    return check_comment_style(
+        text,
+        own_comments=own_comments,
+        hot_comments=hot_comments,
+        strictness=strictness,
+    )
 
 
 def load_credential() -> Credential:
@@ -402,11 +413,11 @@ async def bili_search(keyword: str, num: int = 10, order: str = "totalrank", pag
         num: 返回视频数量，默认10，最大50
         order: 排序方式 totalrank=综合 click=播放量 pubdate=最新 dm=弹幕
         page: 第几页，从 1 开始（一页约 20 条；想多看一屏就翻页）
-    
+
     Returns:
         JSON格式的视频列表，包含标题、BV号、播放量、评论数、UP主等
     """
-    await _throttle()
+    await _human_pause("browse")
     order_map = {
         "totalrank": search.OrderVideo.TOTALRANK,
         "click": search.OrderVideo.CLICK,
@@ -444,22 +455,40 @@ async def bili_search(keyword: str, num: int = 10, order: str = "totalrank", pag
 # ========== Tool 2: 获取评论 ==========
 
 @tool()
-async def bili_comments(bvid: str, num: int = 30) -> str:
+async def bili_comments(bvid: str, num: int = 30, order: str = "like") -> str:
     """
-    获取B站视频的热门评论
+    获取B站视频的评论（支持按热度或按最新时间排序，并附带 AI 撞车检测）
 
     Args:
         bvid: 视频BV号，如"BV1uNk1YxEJQ"
         num: 获取评论数量，默认30
-    
+        order: 排序方式，"like"（按点赞热度，默认）或 "time"（按最新时间）
+
     Returns:
-        JSON格式的评论列表，包含用户名、评论内容、点赞数、回复数
+        JSON格式的评论列表，包含用户名、评论内容、点赞数、回复数与 ai_swarm_suspected
     """
-    await _throttle()
+    await _human_pause("read")
     cred = get_cred()
-    v = video.Video(bvid=bvid, credential=cred)
-    info = await v.get_info()
-    aid = info["aid"]
+    order_norm = str(order or "like").strip().lower()
+    order_enum = (
+        getattr(comment.OrderType, "TIME", comment.OrderType.LIKE)
+        if order_norm == "time"
+        else comment.OrderType.LIKE
+    )
+
+    try:
+        v = video.Video(bvid=bvid, credential=cred)
+        info = await v.get_info()
+        aid = info["aid"]
+    except Exception as e:
+        return json.dumps({
+            "bvid": bvid,
+            "order": "time" if order_norm == "time" else "like",
+            "count": 0,
+            "ai_swarm_suspected": False,
+            "comments": [],
+            "error": f"{type(e).__name__}: {e}",
+        }, ensure_ascii=False)
 
     comments = []
     page = 1
@@ -470,7 +499,7 @@ async def bili_comments(bvid: str, num: int = 30) -> str:
                 oid=aid,
                 type_=comment.CommentResourceType.VIDEO,
                 page_index=page,
-                order=comment.OrderType.LIKE,
+                order=order_enum,
                 credential=cred,
             )
             replies = resp.get("replies") or []
@@ -501,14 +530,23 @@ async def bili_comments(bvid: str, num: int = 30) -> str:
                 comments.append(c)
 
             page += 1
-            await asyncio.sleep(0.5)
+            if len(comments) < num:
+                await _human_pause("browse")
         except Exception as e:
             # ⚠️ 抓取失败（风控 -412 / 网络错）不能吞成「这条视频 0 条评论」：
             #    调用方必须能分辨「真没评论」和「没抓到」，否则日报静默失真。（2026-10-16 审查修）
             fetch_error = f"{type(e).__name__}: {e}"
             break
 
-    out = {"bvid": bvid, "count": len(comments[:num]), "comments": comments[:num]}
+    sliced = comments[:num]
+    ai_swarm = looks_like_ai_swarm([item.get("content", "") for item in sliced])
+    out = {
+        "bvid": bvid,
+        "order": "time" if order_norm == "time" else "like",
+        "count": len(sliced),
+        "ai_swarm_suspected": ai_swarm,
+        "comments": sliced,
+    }
     if fetch_error:
         out["error"] = fetch_error
     return json.dumps(out, ensure_ascii=False)
@@ -523,11 +561,11 @@ async def bili_subtitle(bvid: str) -> str:
 
     Args:
         bvid: 视频BV号，如"BV1uNk1YxEJQ"
-    
+
     Returns:
         视频的完整字幕文本
     """
-    await _throttle()
+    await _human_pause("read")
     cred = get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
@@ -560,8 +598,8 @@ async def bili_subtitle(bvid: str) -> str:
     if sub_url.startswith("//"):
         sub_url = "https:" + sub_url
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(sub_url) as resp:
+    async with aiohttp.ClientSession() as http_session:
+        async with http_session.get(sub_url) as resp:
             sub_data = await resp.json()
 
     texts = [item.get("content", "") for item in sub_data.get("body", [])]
@@ -586,10 +624,11 @@ async def bili_danmaku(bvid: str, num: int = 100) -> str:
     Args:
         bvid: 视频BV号
         num: 获取弹幕数量，默认100
-    
+
     Returns:
         弹幕列表，包含弹幕文本和出现时间
     """
+    await _human_pause("read")
     cred = get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
@@ -613,10 +652,11 @@ async def bili_video_info(bvid: str) -> str:
 
     Args:
         bvid: 视频BV号
-    
+
     Returns:
         视频标题、描述、UP主、播放量、评论数、收藏数等详细数据
     """
+    await _human_pause("read")
     cred = get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
@@ -643,16 +683,6 @@ async def bili_video_info(bvid: str) -> str:
     }, ensure_ascii=False)
 
 
-def _normalize_mention(text: str) -> str:
-    """把「@ 昵称」压成「@昵称」。
-
-    B站 只认紧挨着的写法：`@ No3799` 会被当成普通文字，**不会真的 @ 到人**，
-    而且不会有任何报错 —— 评论照样发出去、接口照样返回成功，只是对方收不到通知。
-    模型写中文时习惯在 @ 后面加一个空格，所以这里在发送前统一压一遍。
-    """
-    return re.sub(r"@\s+", "@", text or "")
-
-
 # ========== Tool 6: 回复评论 ==========
 
 @tool()
@@ -665,19 +695,28 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
         text: 评论/回复的文本内容
         rpid: 要回复的目标评论ID（0表示发表新评论）
         root: 楼层根评论ID（回复一级评论时不用填，回复楼中楼时填根评论ID）
-    
+
     Returns:
         发表结果
     """
     _deny = _guard("bili_reply")
-    if _deny: return _deny
+    if _deny:
+        return _deny
     # ⭐「@ 昵称」压成「@昵称」：B站 只认紧挨着的写法，带空格等于没 @ 到人（而且不报错）
     text = _normalize_mention(text)
+    cred = None
+    cred_err = None
+    try:
+        cred = get_cred()
+    except Exception as e:
+        cred_err = e
     # ⭐ 语感闸门：撞八股 / 撞自己以前的 / 撞这条视频的热评 ⇒ 不发，把改法告诉模型
-    _style = await _style_reason(text, bvid, get_cred())
+    _style = await _style_reason(text, bvid, cred)
     if _style:
         return json.dumps({"ok": False, "sent": False, "blocked_by": "style", "error": _style}, ensure_ascii=False)
-    cred = get_cred()
+    if cred_err is not None:
+        raise cred_err
+    await _human_pause("write")
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
@@ -732,11 +771,12 @@ async def bili_crawl(keyword: str, max_videos: int = 5, comments_per_video: int 
         max_videos: 最多采集视频数，默认5
         comments_per_video: 每个视频采集评论数，默认20
         get_subtitles: 是否获取字幕，默认True
-    
+
     Returns:
         包含视频信息、评论和字幕的完整采集数据
     """
     cred = get_cred()
+    await _human_pause("browse")
 
     # 搜索
     search_result = await search.search_by_type(
@@ -772,7 +812,7 @@ async def bili_crawl(keyword: str, max_videos: int = 5, comments_per_video: int 
                 subtitle_json = await bili_subtitle(bvid=bvid)
                 subtitle_data = json.loads(subtitle_json)
                 subtitle_text = subtitle_data.get("text", "")
-            except:
+            except Exception:
                 pass
 
         results.append({
@@ -781,7 +821,7 @@ async def bili_crawl(keyword: str, max_videos: int = 5, comments_per_video: int 
             "subtitle_text": subtitle_text,
         })
 
-        await asyncio.sleep(1)
+        await _human_pause("browse")
 
     return json.dumps({
         "keyword": keyword,
@@ -882,6 +922,7 @@ async def bili_hot_videos(pn: int = 1, ps: int = 20) -> str:
     Returns:
         热门视频列表，包含标题、播放量、UP主等
     """
+    await _human_pause("browse")
     result = await hot.get_hot_videos(pn=pn, ps=min(ps, 50))
     videos = []
     for item in result.get("list", []):
@@ -915,6 +956,7 @@ async def bili_hot_buzzwords(page_num: int = 1, page_size: int = 20) -> str:
     Returns:
         热搜词列表
     """
+    await _human_pause("browse")
     result = await hot.get_hot_buzzwords(page_num=page_num, page_size=page_size)
     return json.dumps(result, ensure_ascii=False)
 
@@ -932,6 +974,7 @@ async def bili_weekly_hot(week: int = 0) -> str:
     Returns:
         每周必看期数列表或指定期的视频列表
     """
+    await _human_pause("browse")
     if week <= 0:
         result = await hot.get_weekly_hot_videos_list()
         return json.dumps(result, ensure_ascii=False)
@@ -959,6 +1002,7 @@ async def bili_rank(category: str = "all", day: int = 3) -> str:
     Returns:
         排行榜视频列表
     """
+    await _human_pause("browse")
     type_map = {
         "all": rank.RankType.All, "original": rank.RankType.Original,
         "rookie": rank.RankType.Rookie, "douga": rank.RankType.Douga,
@@ -1005,6 +1049,7 @@ async def bili_user_info(uid: int) -> str:
     Returns:
         用户昵称、粉丝数、关注数、签名、等级、视频数等
     """
+    await _human_pause("read")
     cred = get_cred()
     u = user.User(uid=uid, credential=cred)
     info = await u.get_user_info()
@@ -1013,13 +1058,13 @@ async def bili_user_info(uid: int) -> str:
     up_stat = {}
     try:
         up_stat = await u.get_up_stat()
-    except:
+    except Exception:
         pass
 
     relation = {}
     try:
         relation = await u.get_relation_info()
-    except:
+    except Exception:
         pass
 
     return json.dumps({
@@ -1055,6 +1100,7 @@ async def bili_user_videos(uid: int, pn: int = 1, ps: int = 30, order: str = "pu
     Returns:
         视频列表
     """
+    await _human_pause("read")
     cred = get_cred()
     u = user.User(uid=uid, credential=cred)
 
@@ -1099,12 +1145,12 @@ async def bili_favorite_lists(uid: int = 0) -> str:
     Returns:
         收藏夹列表，包含ID、名称、视频数量
     """
+    await _human_pause("read")
     cred = get_cred()
     if uid == 0:
         # 从凭证获取自己的UID
-        import json as _json
-        with open(CRED_FILE) as f:
-            data = _json.load(f)
+        with open(CRED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
         uid = int(data.get("dedeuserid", 0))
 
     result = await favorite_list.get_video_favorite_list(uid=uid, credential=cred)
@@ -1134,6 +1180,7 @@ async def bili_favorite_content(media_id: int, page: int = 1, keyword: str = "")
     Returns:
         收藏夹内的视频列表
     """
+    await _human_pause("read")
     cred = get_cred()
     result = await favorite_list.get_video_favorite_list_content(
         media_id=media_id,
@@ -1176,18 +1223,34 @@ async def bili_send_message(receiver_uid: int, text: str) -> str:
         发送结果
     """
     _deny = _guard("bili_send_message")
-    if _deny: return _deny
-    cred = get_cred()
+    if _deny:
+        return _deny
 
-    if not text or not text.strip():
+    clean_text = sanitize_plain_text(text)
+    if not clean_text:
         return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
+
+    if len(clean_text) > 495:
+        return json.dumps({
+            "success": False,
+            "ok": False,
+            "error": (
+                f"私信超长（当前 {len(clean_text)} 字，安全上限 495 字），"
+                "请精简或拆成多条后再发送，避免触发 B 站 21007。"
+            ),
+            "char_count": len(clean_text),
+            "max_chars": 495,
+        }, ensure_ascii=False)
+
+    cred = get_cred()
+    await _human_pause("write")
 
     try:
         result = await session.send_msg(
             credential=cred,
             receiver_id=receiver_uid,
             msg_type=session.EventType.TEXT,
-            content=text.strip(),
+            content=clean_text,
         )
         # ⭐ 2.0.4（issue #35）：**接口没抛异常 ≠ 真的送到了** ——
         #    以前只要不抛就报 success: True，而 B站 可能出现 code=0 却没给投递回执（msg_key）的情况 ✗
@@ -1208,19 +1271,23 @@ async def bili_send_message(receiver_uid: int, text: str) -> str:
                 "error": "接口回了成功，但**没有投递回执（msg_key）** ⇒ 可能没真正送到（常见于：对方不接受陌生人私信 / 被风控）",
                 "data": data,
             }, ensure_ascii=False)
+        bvids = sorted(set(re.findall(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])", clean_text)))
         # 仅值班轮：真实拿到 msg_key 后记录私信中的 BV 号，普通聊天不会标记。
         duty_day = os.environ.get("BILI_DUTY_RUN_DAY", "")
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", duty_day):
-            bvids = sorted(set(re.findall(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])", text)))
-            if bvids:
-                try:
-                    with (Path(__file__).parent / "dm-deliveries.jsonl").open("a", encoding="utf-8") as f:
-                        f.write(json.dumps({"day": duty_day, "bvids": bvids}, ensure_ascii=False) + "\n")
-                except OSError as e:
-                    print(f"私信已成功，但记录投递失败：{e}", file=sys.stderr)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", duty_day) and bvids:
+            try:
+                with (Path(__file__).parent / "dm-deliveries.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"day": duty_day, "bvids": bvids}, ensure_ascii=False) + "\n")
+            except OSError as e:
+                print(f"私信已成功，但记录投递失败：{e}", file=sys.stderr)
+        try:
+            duty_store.append_dm_history(DUTY_HOME, receiver_uid, "out", clean_text, bvids=bvids)
+        except OSError as e:
+            print(f"私信已成功，但写入 dm-history.jsonl 失败：{e}", file=sys.stderr)
         return json.dumps({
             "success": True,
             "message": f"私信已投递（回执 {str(msg_key)[:12]}…）",
+            "char_count": len(clean_text),
             "data": data,
         }, ensure_ascii=False)
     except Exception as e:
@@ -1237,6 +1304,7 @@ async def bili_unread_messages() -> str:
     Returns:
         各类未读消息数量
     """
+    await _human_pause("read")
     cred = get_cred()
     try:
         result = await session.get_unread_messages(credential=cred)
@@ -1255,6 +1323,7 @@ async def bili_received_replies() -> str:
     Returns:
         回复列表
     """
+    await _human_pause("read")
     cred = get_cred()
     try:
         result = await session.get_replies(credential=cred)
@@ -1273,6 +1342,7 @@ async def bili_received_at_and_likes() -> str:
     Returns:
         包含 at 和 likes 两部分的通知数据
     """
+    await _human_pause("read")
     cred = get_cred()
     result = {}
     try:
@@ -1289,36 +1359,17 @@ async def bili_received_at_and_likes() -> str:
 # ========== 值班轮窄口 IO（2026-10-24 · issue #96 安全加固）==========
 # ⭐ 值班轮现在跑在「最小权限 profile」上：**没有文件系统、没有 shell、没有 web**。
 #    但它还得写日报 / 判重表 / 归档、还得能转写 —— 所以这几件事做成**固定路径的窄口工具**：
-#    · 只写 <家>/out/<日期>.md、<家>/seen.md、<家>/digest/<年-月>.md
+#    · 只写 <家>/out/<日期>.md、<家>/seen.md、<家>/digest/<年-月>.md、<家>/picks/<日期>.jsonl、<家>/memory/*
 #    · **不接受任何路径参数**（想写别处也写不了）✓
 #    · 输入里的竖线会被转义，标题带 | 也不会把表格弄坏
-import datetime as _dt
-
-DUTY_HOME = Path(os.environ.get("BILI_DUTY_HOME") or (Path.home() / ".dsh" / "bili-duty"))
 
 
 def _duty_today() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d")
 
 
-_DUTY_DATE_RE = re.compile(r"^(?:(\d{4})[-/.])?(\d{1,2})[-/.](\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$")
-
-
 def _duty_norm_date(raw: str) -> str:
-    """模型给的日期 → YYYY-MM-DD；认不出来就用今天（#133：以前 `10-23` 原样写进判重表，宿主解析不了）。
-    没写年份按今年补，补出来比今天晚就算去年 —— 跟宿主 lib/state.mjs 的 seenDay 同一套规则。"""
-    today = _dt.date.today()
-    m = _DUTY_DATE_RE.match(str(raw or "").strip())
-    if not m:
-        return today.isoformat()
-    y = int(m.group(1)) if m.group(1) else today.year
-    try:
-        d = _dt.date(y, int(m.group(2)), int(m.group(3)))
-        if not m.group(1) and d > today:
-            d = d.replace(year=y - 1)
-    except ValueError:
-        return today.isoformat()
-    return d.isoformat()
+    return duty_store.norm_date(raw)
 
 
 def _cell(s: str, limit: int = 60) -> str:
@@ -1337,16 +1388,18 @@ def _append(path: Path, text: str) -> str:
 @tool()
 def duty_paths() -> str:
     """
-    这一轮允许写的三个位置（绝对路径）—— 想写东西只能通过这些 duty_* 工具，不要找别的路。
+    这一轮允许写的固定位置（绝对路径）—— 想写东西只能通过这些 duty_* 工具，不要找别的路。
 
     Returns:
-        报告 / 判重表 / 归档 的绝对路径
+        报告 / 判重表 / 归档 / picks / memory 的绝对路径
     """
     out = {
         "home": str(DUTY_HOME),
         "report": str(DUTY_HOME / "out" / (_duty_today() + ".md")),
         "seen": str(DUTY_HOME / "seen.md"),
         "digest": str(DUTY_HOME / "digest" / (_dt.datetime.now().strftime("%Y-%m") + ".md")),
+        "picks": str(DUTY_HOME / "picks" / (_duty_today() + ".jsonl")),
+        "memory_dir": str(DUTY_HOME / "memory"),
     }
     return json.dumps(out, ensure_ascii=False)
 
@@ -1442,6 +1495,147 @@ def duty_digest_append(text: str) -> str:
         return "没写：内容是空的"
     p = DUTY_HOME / "digest" / (_dt.datetime.now().strftime("%Y-%m") + ".md")
     return "已追加到 " + _append(p, body + "\n")
+
+
+def _coerce_tags(tags: list[str] | str | None) -> list[str] | None:
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return [part.strip() for part in re.split(r"[,，\s]+", tags) if part.strip()]
+    return [str(part).strip() for part in tags if str(part).strip()]
+
+
+@tool()
+def duty_pick_record(
+    bvid: str,
+    title: str,
+    up: str,
+    tier: str = "可以看",
+    why: str = "",
+    tags: list[str] | None = None,
+    date: str = "",
+) -> str:
+    """
+    记录一条结构化推荐到 ``picks/<日期>.jsonl``（同 BV 自动覆盖去重）。
+
+    Args:
+        bvid: BV 号（必须符合 BV + 10 位字母数字）
+        title: 视频标题
+        up: UP 主名称
+        tier: 推荐档位（如「必看」「可以看」）
+        why: 一句话推荐理由
+        tags: 标签列表
+        date: 日期（YYYY-MM-DD，留空=今天）
+
+    Returns:
+        JSON 格式写入结果
+    """
+    denied = _guard("duty_pick_record")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    res = duty_store.pick_record(
+        DUTY_HOME,
+        bvid=bvid,
+        title=title,
+        up=up,
+        tier=tier,
+        why=why,
+        tags=_coerce_tags(tags),
+        date=date,
+    )
+    return json.dumps(res, ensure_ascii=False)
+
+
+@tool()
+def duty_report_today(date: str = "", max_chars: int = 12000) -> str:
+    """
+    读取指定日期（默认今天）的日报 Markdown 与结构化 picks 列表。
+
+    Args:
+        date: 日期（YYYY-MM-DD，留空=今天）
+        max_chars: 日报正文截断字符上限，默认 12000
+
+    Returns:
+        JSON 格式：{ok, day, has_report, report, truncated, picks, pick_count}
+    """
+    denied = _guard("duty_report_today")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    res = duty_store.report_today(DUTY_HOME, date=date, max_chars=max_chars)
+    return json.dumps(res, ensure_ascii=False)
+
+
+@tool()
+def duty_digest_search(query: str = "", limit: int = 15) -> str:
+    """
+    在本地 ``digest/*.md`` 和 ``seen.md`` / ``seen/*.md`` 中检索历史记录（按新旧倒序）。
+
+    Args:
+        query: 检索关键词（支持空格分隔多词与大小写忽略）
+        limit: 最多返回条数，默认 15
+
+    Returns:
+        JSON 格式：{ok, query, count, matches}
+    """
+    denied = _guard("duty_digest_search")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    res = duty_store.digest_search(DUTY_HOME, query=query, limit=limit)
+    return json.dumps(res, ensure_ascii=False)
+
+
+@tool()
+def duty_memory_recall(query: str = "", limit: int = 10) -> str:
+    """
+    召回本地长期偏好画像（taste_profile）和情景记忆（episodic_memory）。
+
+    Args:
+        query: 检索关键词或当前主题，留空则返回最近记忆
+        limit: 最多返回情景记忆条数，默认 10
+
+    Returns:
+        JSON 格式：{ok, topics, ups, muted_ups, muted_topics, episodes}
+    """
+    denied = _guard("duty_memory_recall")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    res = duty_store.memory_recall(DUTY_HOME, query=query, limit=limit)
+    return json.dumps(res, ensure_ascii=False)
+
+
+@tool()
+def duty_memory_note(
+    kind: str,
+    subject: str,
+    content: str,
+    affinity: float = 0.0,
+    tags: list[str] | None = None,
+) -> str:
+    """
+    写入一条长期偏好/情景记忆，并原子更新 ``taste_profile.json``。
+
+    Args:
+        kind: 记忆类型（up_impression / topic_interest / dislike / thread / observation）
+        subject: 对象（UP 主名、话题词或线索名）
+        content: 记忆内容说明
+        affinity: 偏好权重增量（如 +1.0 / -1.0）
+        tags: 关联标签列表
+
+    Returns:
+        JSON 格式写入结果
+    """
+    denied = _guard("duty_memory_note")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    res = duty_store.memory_note(
+        DUTY_HOME,
+        kind=kind,
+        subject=subject,
+        content=content,
+        affinity=affinity,
+        tags=_coerce_tags(tags),
+    )
+    return json.dumps(res, ensure_ascii=False)
 
 
 # ========== 转写：非阻塞 + 单条排队 + 可取回的结果 ==========
@@ -1991,10 +2185,10 @@ async def bili_recommend(ps: int = 20) -> str:
     Returns:
         JSON 格式的视频列表，字段与 bili_search 对齐（bvid / title / author / play / danmaku / duration…）
     """
-    await _throttle()
     denied = _guard("bili_recommend")
     if denied:
         return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    await _human_pause("browse")
 
     cred = None
     try:
@@ -2043,6 +2237,460 @@ async def bili_recommend(ps: int = 20) -> str:
         "count": len(videos),
         "videos": videos,
     }, ensure_ascii=False)
+
+
+# ========== v3.0 发现与轻互动工具 ==========
+
+def _format_duration(dur) -> str:
+    if isinstance(dur, (int, float)) and dur >= 0:
+        return f"{int(dur) // 60}:{int(dur) % 60:02d}"
+    return str(dur or "")
+
+
+@tool()
+async def bili_related_videos(bvid: str, limit: int = 12) -> str:
+    """
+    获取某个视频的相关推荐列表（顺藤摸瓜找同类好视频）。
+
+    Args:
+        bvid: 源视频 BV 号
+        limit: 最多返回条数，默认 12，上限 40
+
+    Returns:
+        JSON 格式的相关视频列表
+    """
+    denied = _guard("bili_related_videos")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    bv = str(bvid or "").strip()
+    if not duty_store.BVID_RE.fullmatch(bv):
+        return json.dumps({"ok": False, "bvid": bv, "error": "bvid 格式不对"}, ensure_ascii=False)
+
+    await _human_pause("browse")
+    cred = None
+    try:
+        cred = load_credential()
+    except Exception:
+        cred = None
+
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        raw = await v.get_related()
+    except Exception as e:
+        return json.dumps({"ok": False, "bvid": bv, "error": f"获取相关视频失败：{e}"}, ensure_ascii=False)
+
+    if isinstance(raw, dict):
+        items = raw.get("data") or raw.get("list") or []
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    capped = max(1, min(int(limit or 12), 40))
+    videos = []
+    for item in items[:capped]:
+        if not isinstance(item, dict) or not item.get("bvid"):
+            continue
+        owner = item.get("owner") or {}
+        stat = item.get("stat") or {}
+        videos.append({
+            "bvid": item.get("bvid", ""),
+            "aid": item.get("aid", 0),
+            "title": str(item.get("title", "")).strip(),
+            "author": owner.get("name", ""),
+            "author_uid": owner.get("mid", 0),
+            "play": stat.get("view", 0),
+            "like": stat.get("like", 0),
+            "danmaku": stat.get("danmaku", 0),
+            "reply": stat.get("reply", 0),
+            "duration": _format_duration(item.get("duration", 0)),
+            "tname": item.get("tname", ""),
+            "desc": str(item.get("desc") or "")[:150],
+        })
+
+    return json.dumps({
+        "ok": True,
+        "bvid": bv,
+        "count": len(videos),
+        "videos": videos,
+    }, ensure_ascii=False)
+
+
+def _extract_dynamic_video_item(raw_item: dict) -> dict | None:
+    if not isinstance(raw_item, dict):
+        return None
+    if raw_item.get("bvid"):
+        owner = raw_item.get("owner") or {}
+        return {
+            "id_str": str(raw_item.get("id_str") or ""),
+            "type": str(raw_item.get("type") or "DYNAMIC_TYPE_AV"),
+            "bvid": str(raw_item.get("bvid") or ""),
+            "title": str(raw_item.get("title") or "").strip(),
+            "author": str(raw_item.get("author") or owner.get("name") or ""),
+            "author_uid": raw_item.get("author_uid") or owner.get("mid") or 0,
+            "pub_time": raw_item.get("pub_time") or raw_item.get("pubdate") or "",
+            "duration": _format_duration(raw_item.get("duration") or ""),
+            "desc": str(raw_item.get("desc") or "")[:160],
+        }
+    modules = raw_item.get("modules")
+    if not isinstance(modules, dict):
+        return None
+    author_mod = modules.get("module_author") or {}
+    dyn_mod = modules.get("module_dynamic") or {}
+    major = dyn_mod.get("major") or {}
+    archive = major.get("archive") or {}
+    bv = str(archive.get("bvid") or "")
+    if not bv:
+        return None
+    stat = archive.get("stat") or {}
+    return {
+        "id_str": str(raw_item.get("id_str") or ""),
+        "type": str(raw_item.get("type") or "DYNAMIC_TYPE_AV"),
+        "bvid": bv,
+        "title": str(archive.get("title") or "").strip(),
+        "author": str(author_mod.get("name") or ""),
+        "author_uid": author_mod.get("mid") or 0,
+        "pub_time": author_mod.get("pub_time") or author_mod.get("pub_ts") or "",
+        "duration": str(archive.get("duration_text") or ""),
+        "play": stat.get("play", ""),
+        "danmaku": stat.get("danmaku", ""),
+        "desc": str(archive.get("desc") or "")[:160],
+    }
+
+
+@tool()
+async def bili_dynamic_feed(offset: str = "") -> str:
+    """
+    获取已关注 UP 主的视频动态时间线（适合回访常看作者的新投稿）。
+
+    Args:
+        offset: 分页游标（首次留空，翻页传上次返回的 offset）
+
+    Returns:
+        JSON 格式：{ok, count, has_more, offset, items, error?}
+    """
+    denied = _guard("bili_dynamic_feed")
+    if denied:
+        return json.dumps({"ok": False, "items": [], "error": denied}, ensure_ascii=False)
+    try:
+        cred = get_cred()
+    except Exception as e:
+        return json.dumps({"ok": False, "items": [], "error": str(e)}, ensure_ascii=False)
+
+    await _human_pause("browse")
+
+    fn = getattr(dynamic, "get_dynamic_page_info", None)
+    if fn is None:
+        return json.dumps({
+            "ok": False,
+            "items": [],
+            "error": "当前 bilibili_api 版本不支持 dynamic.get_dynamic_page_info",
+        }, ensure_ascii=False)
+
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        kwargs: dict = {}
+        if "credential" in params or has_var_kw:
+            kwargs["credential"] = cred
+        clean_offset = str(offset or "").strip()
+        if clean_offset:
+            if "offset" in params or has_var_kw:
+                kwargs["offset"] = clean_offset
+            elif "pn" in params and clean_offset.isdigit():
+                kwargs["pn"] = int(clean_offset)
+        dyn_type = getattr(dynamic, "DynamicType", None)
+        if dyn_type is not None and hasattr(dyn_type, "VIDEO"):
+            if "_type" in params:
+                kwargs["_type"] = dyn_type.VIDEO
+            elif "type_" in params:
+                kwargs["type_"] = dyn_type.VIDEO
+        raw = await fn(**kwargs)
+    except Exception as e:
+        return json.dumps({"ok": False, "items": [], "error": f"获取关注动态失败：{e}"}, ensure_ascii=False)
+
+    if not isinstance(raw, dict):
+        return json.dumps({"ok": False, "items": [], "error": "动态接口返回空数据"}, ensure_ascii=False)
+
+    raw_items = raw.get("items") or raw.get("cards") or (raw.get("data") or {}).get("items") or []
+    items = []
+    for entry in raw_items:
+        parsed = _extract_dynamic_video_item(entry)
+        if parsed is not None:
+            items.append(parsed)
+
+    return json.dumps({
+        "ok": True,
+        "count": len(items),
+        "has_more": bool(raw.get("has_more", False)),
+        "offset": str(raw.get("offset") or ""),
+        "items": items,
+    }, ensure_ascii=False)
+
+
+@tool()
+async def bili_history(max_oid: int = 0, ps: int = 20) -> str:
+    """
+    读取当前账号最近的 B 站观看历史（避免推荐用户已经看过的视频）。
+
+    Args:
+        max_oid: 分页游标（可选，默认 0）
+        ps: 返回条数，默认 20，上限 50
+
+    Returns:
+        JSON 格式：{ok, count, bvids, videos, error?}
+    """
+    denied = _guard("bili_history")
+    if denied:
+        return json.dumps({"ok": False, "bvids": [], "videos": [], "error": denied}, ensure_ascii=False)
+    try:
+        cred = get_cred()
+    except Exception as e:
+        return json.dumps({"ok": False, "bvids": [], "videos": [], "error": str(e)}, ensure_ascii=False)
+
+    await _human_pause("browse")
+
+    fn = getattr(user, "get_self_history", None) or getattr(user, "get_self_history_new", None)
+    if fn is None:
+        return json.dumps({
+            "ok": False,
+            "bvids": [],
+            "videos": [],
+            "error": "当前 bilibili_api 版本不支持 get_self_history",
+        }, ensure_ascii=False)
+
+    clamped_ps = max(1, min(int(ps or 20), 50))
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        kwargs: dict = {}
+        if "credential" in params or has_var_kw:
+            kwargs["credential"] = cred
+        if "per_page_item" in params:
+            kwargs["per_page_item"] = clamped_ps
+        elif "ps" in params or has_var_kw:
+            kwargs["ps"] = clamped_ps
+        if "page_num" in params:
+            kwargs["page_num"] = 1
+        if max_oid:
+            if "max_oid" in params:
+                kwargs["max_oid"] = int(max_oid)
+            elif "max" in params or has_var_kw:
+                kwargs["max"] = int(max_oid)
+        hist_type = getattr(user, "HistoryType", None)
+        if "_type" in params and hist_type is not None and hasattr(hist_type, "ARCHIVE"):
+            kwargs["_type"] = hist_type.ARCHIVE
+        raw = await fn(**kwargs)
+    except Exception as e:
+        return json.dumps({"ok": False, "bvids": [], "videos": [], "error": f"获取观看历史失败：{e}"}, ensure_ascii=False)
+
+    if raw is None:
+        return json.dumps({"ok": False, "bvids": [], "videos": [], "error": "观看历史接口返回空"}, ensure_ascii=False)
+
+    if isinstance(raw, list):
+        raw_list = raw
+    elif isinstance(raw, dict):
+        raw_list = raw.get("list") or (raw.get("data") or {}).get("list") or []
+    else:
+        raw_list = []
+
+    videos = []
+    bvids = []
+    seen_bv: set[str] = set()
+    for item in raw_list[:clamped_ps]:
+        if not isinstance(item, dict):
+            continue
+        hist_meta = item.get("history") if isinstance(item.get("history"), dict) else {}
+        bv = str(hist_meta.get("bvid") or item.get("bvid") or "").strip()
+        if bv and bv not in seen_bv:
+            seen_bv.add(bv)
+            bvids.append(bv)
+        videos.append({
+            "bvid": bv,
+            "title": str(item.get("title") or "").strip(),
+            "author": str(item.get("author_name") or (item.get("owner") or {}).get("name") or ""),
+            "view_at": item.get("view_at", 0),
+            "progress": item.get("progress", 0),
+            "duration": item.get("duration", 0),
+        })
+
+    return json.dumps({
+        "ok": True,
+        "count": len(videos),
+        "bvids": bvids,
+        "videos": videos,
+    }, ensure_ascii=False)
+
+
+@tool()
+async def bili_like(bvid: str) -> str:
+    """
+    给优质视频点赞（受白名单与互动开关保护）。
+
+    Args:
+        bvid: 视频 BV 号
+
+    Returns:
+        JSON 格式点赞结果
+    """
+    denied = _guard("bili_like")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    bv = str(bvid or "").strip()
+    if not duty_store.BVID_RE.fullmatch(bv):
+        return json.dumps({"ok": False, "bvid": bv, "error": "bvid 格式不对"}, ensure_ascii=False)
+
+    try:
+        cred = get_cred()
+    except Exception as e:
+        return json.dumps({"ok": False, "bvid": bv, "error": str(e)}, ensure_ascii=False)
+
+    await _human_pause("write")
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        res = await v.like(True)
+        return json.dumps({
+            "ok": True,
+            "bvid": bv,
+            "already": False,
+            "data": res if isinstance(res, dict) else {},
+        }, ensure_ascii=False)
+    except Exception as e:
+        msg = str(e)
+        if "已赞" in msg or "已经" in msg or "65006" in msg or "already" in msg.lower():
+            return json.dumps({
+                "ok": True,
+                "bvid": bv,
+                "already": True,
+                "message": "之前已经赞过了",
+            }, ensure_ascii=False)
+        return json.dumps({"ok": False, "bvid": bv, "error": msg}, ensure_ascii=False)
+
+
+@tool()
+async def bili_watch_later_add(bvid: str) -> str:
+    """
+    把视频加入「稍后再看」（受白名单与互动开关保护）。
+
+    Args:
+        bvid: 视频 BV 号
+
+    Returns:
+        JSON 格式操作结果
+    """
+    denied = _guard("bili_watch_later_add")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    bv = str(bvid or "").strip()
+    if not duty_store.BVID_RE.fullmatch(bv):
+        return json.dumps({"ok": False, "bvid": bv, "error": "bvid 格式不对"}, ensure_ascii=False)
+
+    try:
+        cred = get_cred()
+    except Exception as e:
+        return json.dumps({"ok": False, "bvid": bv, "error": str(e)}, ensure_ascii=False)
+
+    await _human_pause("write")
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        fn = getattr(user, "set_watch_later", None)
+        if fn is None:
+            fn = getattr(v, "set_watch_later", None) or getattr(v, "add_watch_later", None)
+        if fn is None:
+            fn = getattr(user, "add_to_toview", None)
+        if fn is None:
+            return json.dumps({
+                "ok": False,
+                "bvid": bv,
+                "error": "当前 bilibili_api 版本不支持稍后再看接口",
+            }, ensure_ascii=False)
+
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        kwargs: dict = {}
+        if "bvid" in params:
+            kwargs["bvid"] = bv
+        elif "aid" in params:
+            info = await v.get_info()
+            kwargs["aid"] = info["aid"]
+        elif has_var_kw:
+            kwargs["bvid"] = bv
+        if "add" in params:
+            kwargs["add"] = True
+        elif "delete" in params:
+            kwargs["delete"] = False
+        if "credential" in params or has_var_kw:
+            kwargs["credential"] = cred
+
+        res = await fn(**kwargs)
+        return json.dumps({
+            "ok": True,
+            "bvid": bv,
+            "already": False,
+            "data": res if isinstance(res, dict) else {},
+        }, ensure_ascii=False)
+    except Exception as e:
+        msg = str(e)
+        if "已" in msg or "already" in msg.lower():
+            return json.dumps({
+                "ok": True,
+                "bvid": bv,
+                "already": True,
+                "message": "已经在稍后再看里了",
+            }, ensure_ascii=False)
+        return json.dumps({"ok": False, "bvid": bv, "error": msg}, ensure_ascii=False)
+
+
+@tool()
+async def bili_coin(bvid: str, num: int = 1) -> str:
+    """
+    给非常喜欢的视频投币（1-2 个，受白名单与互动开关保护）。
+
+    Args:
+        bvid: 视频 BV 号
+        num: 投币数量（自动限制在 1..2）
+
+    Returns:
+        JSON 格式投币结果
+    """
+    denied = _guard("bili_coin")
+    if denied:
+        return json.dumps({"ok": False, "error": denied}, ensure_ascii=False)
+    bv = str(bvid or "").strip()
+    if not duty_store.BVID_RE.fullmatch(bv):
+        return json.dumps({"ok": False, "bvid": bv, "error": "bvid 格式不对"}, ensure_ascii=False)
+
+    coin_num = max(1, min(int(num or 1), 2))
+    try:
+        cred = get_cred()
+    except Exception as e:
+        return json.dumps({"ok": False, "bvid": bv, "error": str(e)}, ensure_ascii=False)
+
+    await _human_pause("write")
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        res = await v.pay_coin(num=coin_num)
+        return json.dumps({
+            "ok": True,
+            "bvid": bv,
+            "num": coin_num,
+            "already": False,
+            "data": res if isinstance(res, dict) else {},
+        }, ensure_ascii=False)
+    except Exception as e:
+        msg = str(e)
+        if "34005" in msg or "投币上限" in msg or "已投" in msg or "已经" in msg or "already" in msg.lower():
+            return json.dumps({
+                "ok": True,
+                "bvid": bv,
+                "num": coin_num,
+                "already": True,
+                "message": msg,
+            }, ensure_ascii=False)
+        return json.dumps({"ok": False, "bvid": bv, "error": msg}, ensure_ascii=False)
 
 
 # ========== 启动 ==========

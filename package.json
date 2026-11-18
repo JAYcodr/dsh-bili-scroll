@@ -1,7 +1,7 @@
 {
   "name": "dsh-bili-scroll",
-  "version": "2.5.2",
-  "description": "DSH 插件：每天替你刷一轮 B站 —— 读字幕挑出值得的、写一份日报，值得的就 @ 你",
+  "version": "3.0.0",
+  "description": "DSH 插件（友邻拟人重构版）：带长期记忆、有机浏览节律与朋友口吻安利的 B站 刷片助手",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -12,11 +12,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/c1overzz/dsh-bili-scroll.git"
+    "url": "git+https://github.com/JAYcodr/dsh-bili-scroll.git"
   },
-  "homepage": "https://github.com/c1overzz/dsh-bili-scroll#readme",
+  "homepage": "https://github.com/JAYcodr/dsh-bili-scroll#readme",
   "bugs": {
-    "url": "https://github.com/c1overzz/dsh-bili-scroll/issues"
+    "url": "https://github.com/JAYcodr/dsh-bili-scroll/issues"
   },
   "license": "MIT",
   "type": "module",
@@ -34,6 +34,7 @@
     "lib",
     "prompts",
     "vendor",
+    "docs",
     "README.md",
     "AGENTS.md",
     "selfcheck.mjs",
